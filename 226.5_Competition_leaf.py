@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from torchvision.models import resnet18, ResNet18_Weights
+from torchvision.models import resnet50, ResNet50_Weights
 import pandas as pd
 from PIL import Image
 import os
@@ -12,10 +12,10 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # ---------------------- 1. 参数设置 ----------------------
 k = 5
-num_epochs = 50
-lr = 0.001
-weight_decay = 0.0001
-batch_size = 256
+num_epochs = 30
+lr = 0.0001
+weight_decay = 1e-5
+batch_size = 32
 image_dir = "./01_data/03_DataSet_Kaggle_leaves"
 
 # ---------------------- 2. 自定义 Dataset ----------------------
@@ -41,7 +41,7 @@ class LeafDataset(Dataset):
 class ResNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.resnet = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        self.resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
         self.resnet.fc = nn.Sequential(
             nn.Dropout(0.5),
             nn.Linear(self.resnet.fc.in_features, 176)
@@ -73,31 +73,13 @@ test_transform = transforms.Compose([
 ])
 
 
-# ---------------------- 5. 数据划分 ----------------------
-def get_k_fold_data(k, i, features, labels):
-    assert k > 1
-    fold_size = len(features) // k
-    X_train, y_train = [], []
-    for j in range(k):
-        idx = slice(j * fold_size, (j + 1) * fold_size)
-        X_part, y_part = features[idx], labels[idx]
-        if j == i:
-            X_valid, y_valid = X_part, y_part
-        else:
-            X_train.extend(X_part)
-            y_train.extend(y_part)
-    return X_train, y_train, X_valid, y_valid
-def init_weights(m):
-    if type(m) in [nn.Linear, nn.Conv2d]:
-        nn.init.normal_(m.weight, std=0.01)
-            
+
 # ---------------------- 6. 训练函数 ----------------------
 def train(train_dataset, test_dataset, k=-1):
     net = ResNet().to(device)
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
-    loss_fn = nn.CrossEntropyLoss()
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-    net.apply(init_weights)
+    loss_fn = nn.CrossEntropyLoss(reduction='mean')
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
@@ -124,6 +106,7 @@ def train(train_dataset, test_dataset, k=-1):
 
         train_loss /= len(train_loader)
         train_acc = correct / total
+        scheduler.step()
 
         # --- 测试 ---
         net.eval()
@@ -145,33 +128,138 @@ def train(train_dataset, test_dataset, k=-1):
         test_acc = correct / total
 
         print(f'K: {k}, Epoch: {epoch+1}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}, Train Acc:{train_acc:.4f}, Test Acc: {test_acc:.4f}')
-        scheduler.step()
 
     return train_loss, test_loss, train_acc, test_acc
 
 # ---------------------- 7. K折交叉验证 ----------------------
+from sklearn.model_selection import StratifiedKFold
+
 def train_k_fold(k):
     train_data = pd.read_csv(f"{image_dir}/train.csv")
     le = LabelEncoder()
-    train_data['label'] = le.fit_transform(train_data.iloc[:, 1])  # 编码标签
+    train_data['label'] = le.fit_transform(train_data.iloc[:, 1])  # 标签编码
+    
+    all_imgs = train_data.iloc[:, 0].values
+    all_labels = train_data['label'].values
+
+    total_train_loss, total_test_loss = 0.0, 0.0
+    total_train_acc, total_test_acc = 0.0, 0.0    
+
+    skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=42)
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(all_imgs, all_labels)):
+        torch.cuda.empty_cache()  # 清理显存
+
+        # 划分数据
+        train_imgs, val_imgs = all_imgs[train_idx], all_imgs[val_idx]
+        train_labels, val_labels = all_labels[train_idx], all_labels[val_idx]
+
+        # 构建数据集
+        train_dataset = LeafDataset(train_imgs, train_labels, image_dir, train_transform)
+        val_dataset = LeafDataset(val_imgs, val_labels, image_dir, test_transform)
+
+        # 训练
+        train_loss, val_loss, train_acc, val_acc = train(train_dataset, val_dataset, k=fold+1)
+
+        # 统计
+        total_train_loss += train_loss
+        total_test_loss += val_loss
+        total_train_acc += train_acc
+        total_test_acc += val_acc
+
+    print(f'K折交叉验证结果:\n'
+          f'平均训练损失: {total_train_loss/k:.4f}, 平均验证损失: {total_test_loss/k:.4f}, '
+          f'平均训练准确率: {total_train_acc/k:.4f}, 平均验证准确率: {total_test_acc/k:.4f}')
+
+#------------------------ 用全部数据集训练 ------------------------
+def train_full_data():
+    # 读取数据
+    train_data = pd.read_csv(f"{image_dir}/train.csv")
+    le = LabelEncoder()
+    train_data['label'] = le.fit_transform(train_data.iloc[:, 1])
 
     all_imgs = train_data.iloc[:, 0].values
     all_labels = train_data['label'].values
-    total_train_loss, total_test_loss = 0.0, 0.0
-    total_train_acc, total_test_acc = 0.0, 0.0    
-    for i in range(k):
-        torch.cuda.empty_cache()  # 清理显存
-        train_imgs, train_labels, test_imgs, test_labels = get_k_fold_data(k, i, all_imgs, all_labels)
-        train_dataset = LeafDataset(train_imgs, train_labels, image_dir, train_transform)
-        test_dataset = LeafDataset(test_imgs, test_labels, image_dir, test_transform)
-        train_loss, test_loss, train_acc, test_acc=train(train_dataset, test_dataset, k=i+1)
-        total_train_loss += train_loss
-        total_test_loss += test_loss
-        total_train_acc += train_acc
-        total_test_acc += test_acc
-    print(f'K折交叉验证结果:\n'
-          f'平均训练损失: {total_train_loss/k:.4f}, 平均测试损失: {total_test_loss/k:.4f}, '
-          f'平均训练准确率: {total_train_acc/k:.4f}, 平均测试准确率: {total_test_acc/k:.4f}')
+
+    # 构建Dataset
+    full_dataset = LeafDataset(all_imgs, all_labels, image_dir, train_transform)
+
+    # 使用train_transform，因为不再划分验证集
+    full_loader = DataLoader(full_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+    # 初始化模型
+    net = ResNet().to(device)
+
+    # 优化器和学习率
+    optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+    loss_fn = nn.CrossEntropyLoss(reduction='mean')
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+    print("开始用全部数据训练")
+    for epoch in range(num_epochs):
+        net.train()
+        total_loss = 0.0
+        correct, total = 0, 0
+
+        for X, y in full_loader:
+            X, y = X.to(device), y.to(device, dtype=torch.long)
+            optimizer.zero_grad()
+            outputs = net(X)
+            loss = loss_fn(outputs, y)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            preds = outputs.argmax(dim=1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+
+        avg_loss = total_loss / len(full_loader)
+        acc = correct / total
+        scheduler.step()
+
+        print(f'Epoch: {epoch+1}, Loss: {avg_loss:.4f}, Accuracy: {acc:.4f}')
+
+    # 保存模型
+    torch.save(net.state_dict(), 'leaf_model_full.pth')
+    print("模型已保存为 leaf_model_full.pth")
+
+    return net, le
+
+# -----------------------预测-----------------------
+def predict_test(model, label_encoder):
+    test_data = pd.read_csv(f"{image_dir}/test.csv")
+    test_imgs = test_data.iloc[:, 0].values
+
+    test_dataset = LeafDataset(test_imgs, labels=[0]*len(test_imgs), img_dir=image_dir, transform=test_transform)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+    model.eval()
+    preds = []
+
+    with torch.no_grad():
+        for X, _ in test_loader:
+            X = X.to(device)
+            outputs = model(X)
+            pred = outputs.argmax(dim=1).cpu().numpy()
+            preds.extend(pred)
+
+    # 转换回原始标签
+    preds_labels = label_encoder.inverse_transform(preds)
+
+    submission = pd.DataFrame({
+        'image': test_imgs,
+        'label': preds_labels
+    })
+    submission.to_csv('submission.csv', index=False)
+    print("提交文件已保存为 submission.csv")
+
+
+
 # ---------------------- 8. 运行 ----------------------
 if __name__ == "__main__":
-    train_k_fold(k)
+    #train_k_fold(k)
+    # 1️⃣ 用全部数据训练
+    model, label_encoder = train_full_data()
+
+    # 2️⃣ 用训练好的模型做测试集预测并保存提交文件
+    predict_test(model, label_encoder)
