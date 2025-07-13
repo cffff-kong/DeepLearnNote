@@ -90,9 +90,15 @@ test_transform = transforms.Compose([
                                      [0.229,0.224,0.225])])
 # ---------------------- 5. 训练函数 ----------------------
 def train(train_dataset, test_dataset, k=-1):
-    net = ConvNextNet().to(device)
+    net = ResNet().to(device)
     #optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
-    optimizer = torch.optim.AdamW(net.parameters(), lr=5e-4, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW([
+    {'params': net.resnet.fc.parameters(), 'lr': 5e-4},      # 新加的头部，用较大学习率
+    {'params': net.resnet.layer4.parameters(), 'lr': 1e-4},  # 越深层学习率可以稍大
+    {'params': net.resnet.layer3.parameters(), 'lr': 1e-5},
+    {'params': net.resnet.layer2.parameters(), 'lr': 5e-6},
+    {'params': net.resnet.layer1.parameters(), 'lr': 1e-6},
+], weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=30)
 
     loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
