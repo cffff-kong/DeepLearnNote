@@ -91,6 +91,7 @@ def train(train_dataset, test_dataset, k=-1):
         correct, total = 0, 0  # 准确率统计
 
         for X, y in train_loader:
+            print(X.shape, y.shape)
             X, y = X.to(device), y.to(device, dtype=torch.long)
             optimizer.zero_grad()
             outputs = net(X)
@@ -257,7 +258,7 @@ def predict_test(model, label_encoder):
 
 # ---------------------- 8. 运行 ----------------------
 if __name__ == "__main__":
-    #train_k_fold(k)
+    train_k_fold(k)
     # 1️⃣ 用全部数据训练
     model, label_encoder = train_full_data()
 
